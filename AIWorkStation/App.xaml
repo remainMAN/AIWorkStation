@@ -1,0 +1,19 @@
+<Application x:Class="AIWorkStation.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:AIWorkStation"
+             xmlns:ui="clr-namespace:AIWorkStation.UI.Converters">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="/AIWorkStation;component/UI/Styles/Theme.xaml" />
+            </ResourceDictionary.MergedDictionaries>
+            <local:BooleanToOnOffConverter x:Key="BooleanToOnOffConverter" />
+            <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+            <ui:EnumEqualsConverter x:Key="EnumEqualsConverter" />
+            <ui:InverseBooleanToVisibilityConverter x:Key="InverseBooleanToVisibilityConverter" />
+            <ui:NullOrEmptyToVisibilityConverter x:Key="NullOrEmptyToVisibilityConverter" />
+            <ui:ConnectionModeDisplayConverter x:Key="ConnectionModeDisplayConverter" />
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

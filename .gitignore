@@ -1,0 +1,94 @@
+# ================================
+# Visual Studio / IDE
+# ================================
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# ================================
+# .NET build output
+# ================================
+**/bin/
+**/obj/
+TestResults/
+coverage/
+.coverage/
+*.trx
+
+# ================================
+# Publish / release output
+# ================================
+artifacts/
+dist/
+publish/
+packages/
+
+# ================================
+# Local build tools
+# ================================
+.tools/
+.tools-wix5/
+
+# ================================
+# Temporary / logs / cache
+# ================================
+*.tmp
+*.temp
+*.cache
+*.log
+*.bak
+
+# ================================
+# AIWorkStation runtime data
+# ================================
+credential-cache.bin
+candidate-*.yaml
+transaction.json
+transaction*.json
+backup/
+backups/
+snapshot/
+snapshots/
+runtime/
+journal/
+
+# ================================
+# Secrets
+# ================================
+.env
+.env.*
+!.env.example
+
+*.pfx
+*.p12
+*.key
+*.pem
+
+# ================================
+# Clash / Mihomo user runtime data
+# ================================
+clash-verge.yaml
+profiles.yaml
+merge.yaml
+script.js
+
+subscriptions/
+runtime-config/
+customer-data/
+
+# ================================
+# Temporary audit archives
+# ================================
+*.zip
+*.rar
+*.7z
+
+# ================================
+# Operating system
+# ================================
+Thumbs.db
+Desktop.ini
+.DS_Store

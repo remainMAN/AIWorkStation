@@ -1,0 +1,14 @@
+AI WorkStation 1.0.0 试用说明
+
+系统要求：
+- Windows 10 / 11 x64
+- Clash Verge Rev 2.5.2
+- Clash Verge 与 verge-mihomo 已正常运行
+- 当前订阅和网络可用
+
+安装后可从桌面或开始菜单启动 AI WorkStation。
+
+这是未进行商业代码签名的测试版本。Windows 可能显示“未知发布者”；
+请仅将安装包提供给明确知晓来源的测试人员。
+
+卸载：Windows 设置 → 应用 → 已安装的应用 → AI WorkStation。

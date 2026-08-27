@@ -1,0 +1,72 @@
+AIWorkStationClean\
+|-- .gitignore
+|-- AIWorkStation.sln
+|-- README.md
+|-- V1_BACKEND_FINALIZATION_REPORT.md
+|-- NO_NEW_GATE_FINAL_AUDIT.md
+|-- THIRD_AUDIT_REMEDIATION_REPORT.md
+|-- POSTFIX_AUDIT_REPORT.md
+|-- CHANGED_FILES.txt
+|-- SOURCE_TREE.txt
+|-- AUDIT_MANIFEST.md
+|-- Packaging\
+|   |-- Product.wxs
+|   `-- 试用说明.txt
+|-- AIWorkStation\
+|   |-- AIWorkStation.csproj
+|   |-- App.xaml / App.xaml.cs
+|   |-- MainWindow.xaml / MainWindow.xaml.cs
+|   |-- AssemblyInfo.cs
+|   |-- BooleanToOnOffConverter.cs
+|   |-- GlobalUsings.cs
+|   |-- Models\
+|   |   |-- CoreModels.cs
+|   |   `-- YamlProfileModels.cs
+|   |-- Properties\PublishProfiles\win-x64.pubxml
+|   |-- Services\
+|   |   |-- ApplicationFinder.cs
+|   |   |-- PackagedApplicationSource.cs
+|   |   |-- OpenAIApplicationMatcher.cs
+|   |   |-- ApplyEngine.cs
+|   |   |-- RouteScriptBuilder.cs
+|   |   |-- ScriptValidator.cs
+|   |   |-- RouteVerifier.cs
+|   |   |-- RecoveryService.cs
+|   |   |-- MihomoNamedPipeClient.cs
+|   |   |-- MihomoLocalProxyExitTester.cs
+|   |   |-- MihomoValidator.cs
+|   |   |-- ClashVergeDetector.cs
+|   |   |-- EnvironmentDetector.cs
+|   |   |-- SubscriptionInspector.cs
+|   |   `-- remaining production services
+|   |-- ViewModels\MainViewModel.cs
+|   `-- Views\
+|       |-- EnvironmentStep.xaml / .xaml.cs
+|       |-- RoutingStep.xaml / .xaml.cs
+|       |-- ConfirmStep.xaml / .xaml.cs
+|       `-- ResultStep.xaml / .xaml.cs
+`-- AIWorkStation.Tests\
+    |-- AIWorkStation.Tests.csproj
+    |-- ApplicationAndStaticExitTests.cs
+    |-- ApplyEngineIntegrationTests.cs
+    |-- AuditRemediationTests.cs
+    |-- CandidateCredentialSafetyTests.cs
+    |-- ClashRuntimeDetectionTests.cs
+    |-- EnvironmentAndSubscriptionTests.cs
+    |-- MainViewModelRemediationTests.cs
+    |-- NodeLatencyTests.cs
+    |-- PackagedApplicationDiscoveryTests.cs
+    |-- RecoverySemanticTests.cs
+    |-- ResultNavigationTests.cs
+    |-- RouteVerifierConnectionBaselineTests.cs
+    |-- ScriptAndValidationTests.cs
+    |-- StaticExitStabilityTests.cs
+    |-- TemporaryCredentialCacheTests.cs
+    |-- TestHelpers.cs
+    `-- WriteRecoveryAndMessageTests.cs
+
+Excluded generated/output directories:
+bin, obj, .vs, .git, TestResults, coverage, packages, artifacts, dist, .tools, .tools-wix5.
+
+Excluded runtime/private data:
+credential-cache.bin, candidate YAML, transaction marker, backup workspace, real Clash/profile/subscription data and real proxy credentials.

@@ -1,0 +1,43 @@
+AIWorkStationClean - V1 Backend Finalization
+Generated: 2026-08-25
+
+Modified production files:
+AIWorkStation\Models\CoreModels.cs
+AIWorkStation\Services\ApplicationFinder.cs
+AIWorkStation\Services\ApplyEngine.cs
+AIWorkStation\Services\EnvironmentDetector.cs
+AIWorkStation\Services\MihomoNamedPipeClient.cs
+AIWorkStation\Services\RecoveryService.cs
+AIWorkStation\Services\RouteScriptBuilder.cs
+AIWorkStation\Services\RouteVerifier.cs
+AIWorkStation\Services\ScriptValidator.cs
+AIWorkStation\Services\SubscriptionInspector.cs
+AIWorkStation\ViewModels\MainViewModel.cs
+AIWorkStation\Views\RoutingStep.xaml
+
+Modified test files:
+AIWorkStation.Tests\ApplyEngineIntegrationTests.cs
+AIWorkStation.Tests\AuditRemediationTests.cs
+AIWorkStation.Tests\EnvironmentAndSubscriptionTests.cs
+AIWorkStation.Tests\MainViewModelRemediationTests.cs
+AIWorkStation.Tests\PackagedApplicationDiscoveryTests.cs
+AIWorkStation.Tests\RecoverySemanticTests.cs
+
+Added test files:
+AIWorkStation.Tests\RouteVerifierConnectionBaselineTests.cs
+
+Added or refreshed audit documents:
+V1_BACKEND_FINALIZATION_REPORT.md
+NO_NEW_GATE_FINAL_AUDIT.md
+CHANGED_FILES.txt
+SOURCE_TREE.txt
+AUDIT_MANIFEST.md
+
+Deleted files:
+None
+
+Dependency changes:
+None
+
+Architecture changes:
+None - the existing ApplyEngine pipeline remains the only deployment pipeline.

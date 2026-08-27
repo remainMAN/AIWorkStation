@@ -1,0 +1,45 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="AI WorkStation"
+      Manufacturer="AI WorkStation"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="D635257A-ACB3-4EB4-AB5A-A8CB8B419F65"
+      Scope="perUser"
+      InstallerVersion="500">
+
+    <SummaryInformation Description="AI WorkStation Windows x64 试用版" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 AI WorkStation。" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDirectory" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="AI WorkStation">
+          <Component Id="ApplicationFiles" Guid="E430F6A0-63AB-4C96-87E5-3A5CF3E6AB6D">
+            <!-- 安装包只消费 win-x64 SelfContained publish 产物，不能指向普通 build 输出。 -->
+            <File Id="AIWorkStationExecutable"
+                  Source="$(var.PublishDir)\AIWorkStation.exe"
+                  KeyPath="yes">
+              <Shortcut Id="StartMenuShortcut"
+                        Directory="ProgramMenuFolder"
+                        Name="AI WorkStation"
+                        Description="为指定 Windows 程序配置 Clash 静态出口分流"
+                        WorkingDirectory="INSTALLFOLDER"
+                        Advertise="no" />
+              <Shortcut Id="DesktopShortcut"
+                        Directory="DesktopFolder"
+                        Name="AI WorkStation"
+                        Description="为指定 Windows 程序配置 Clash 静态出口分流"
+                        WorkingDirectory="INSTALLFOLDER"
+                        Advertise="no" />
+            </File>
+            <File Id="TrialGuide" Source="$(var.ProjectDir)\Packaging\试用说明.txt" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="AI WorkStation" Level="1">
+      <ComponentRef Id="ApplicationFiles" />
+    </Feature>
+  </Package>
+</Wix>
