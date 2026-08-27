@@ -4,7 +4,7 @@ Repository:
 https://github.com/remainMAN/AIWorkStation
 
 Visibility:
-Private
+Public
 
 Branch:
 main
