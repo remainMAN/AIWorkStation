@@ -13,17 +13,20 @@ public sealed class RecoveryService
     private readonly ClashReloadService _reloader;
     private readonly TransactionMarkerService _markers;
     private readonly Func<string, IMihomoRuntimeClient> _pipeFactory;
+    private readonly MihomoRuntimeConvergence _runtimeConvergence;
 
     public RecoveryService(
         AtomicFileWriter? writer = null,
         ClashReloadService? reloader = null,
         TransactionMarkerService? markers = null,
-        Func<string, IMihomoRuntimeClient>? pipeFactory = null)
+        Func<string, IMihomoRuntimeClient>? pipeFactory = null,
+        MihomoRuntimeConvergence? runtimeConvergence = null)
     {
         _writer = writer ?? new AtomicFileWriter();
         _reloader = reloader ?? new ClashReloadService();
         _markers = markers ?? new TransactionMarkerService();
         _pipeFactory = pipeFactory ?? (pipePath => new MihomoNamedPipeClient(pipePath));
+        _runtimeConvergence = runtimeConvergence ?? new MihomoRuntimeConvergence();
     }
 
     public static async Task<RecoveryBaseline> CaptureBaselineAsync(
@@ -126,11 +129,27 @@ public sealed class RecoveryService
     }
 
     public async Task<bool> RecoverAsync(TransactionMarker marker, CancellationToken token = default)
+        => await RecoverAsync(marker, marker.Targets, verifyOriginalBaseline: true, token);
+
+    internal async Task<bool> RecoverAsync(
+        TransactionMarker marker,
+        IReadOnlyCollection<string> restoreTargets,
+        bool verifyOriginalBaseline,
+        CancellationToken token = default)
     {
         try
         {
             var manifest = BackupService.ReadManifest(marker.BackupDirectory);
-            foreach (var entry in manifest.Entries)
+            var normalizedTargets = restoreTargets
+                .Select(Path.GetFullPath)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (normalizedTargets.Count == 0) return false;
+            var entries = manifest.Entries
+                .Where(entry => normalizedTargets.Contains(Path.GetFullPath(entry.TargetPath)))
+                .ToArray();
+            if (entries.Length != normalizedTargets.Count) return false;
+
+            foreach (var entry in entries)
             {
                 if (entry.Existed)
                 {
@@ -148,7 +167,7 @@ public sealed class RecoveryService
                 }
                 else if (File.Exists(entry.TargetPath)) File.Delete(entry.TargetPath);
             }
-            foreach (var entry in manifest.Entries)
+            foreach (var entry in entries)
             {
                 if (entry.Existed && (!File.Exists(entry.TargetPath) || FileHash.Sha256(entry.TargetPath) != entry.OriginalSha256)) return false;
                 if (!entry.Existed && File.Exists(entry.TargetPath)) return false;
@@ -156,7 +175,7 @@ public sealed class RecoveryService
             // 文件恢复成功并不代表 Mihomo 运行态已经恢复。
             // Reload 只有在进程、Runtime 和 Controller 均可访问时才返回成功。
             if (!await _reloader.RestartAsync(marker.ClashExecutable, marker.RuntimeConfigPath, token)) return false;
-            if (manifest.RecoveryBaseline is not null &&
+            if (verifyOriginalBaseline && manifest.RecoveryBaseline is not null &&
                 !await VerifyRecoveryBaselineAsync(marker, manifest.RecoveryBaseline, token)) return false;
 
             // 先消除事务 Marker，再清理可孤立重试的加密备份，避免 Marker 指向已删除 workspace。
@@ -206,22 +225,41 @@ public sealed class RecoveryService
 
         var settings = ClashVergeDetector.ReadRuntimeSettings(marker.RuntimeConfigPath);
         var client = _pipeFactory(settings.ControllerPipe);
-        if (baseline.Runtime.ManagedGroupExists &&
-            !string.IsNullOrWhiteSpace(baseline.Runtime.ManagedGroupSelection))
-        {
-            if (client is not IMihomoApplyClient controller) return false;
-            // store-selected 可能保留失败 Apply 的新选择；Recovery 必须主动选回旧 transport。
-            await controller.SelectProxyAsync(
-                RouteScriptBuilder.StaticGroupName,
-                baseline.Runtime.ManagedGroupSelection,
-                token);
-        }
-        var currentRuntime = await CaptureRuntimeSemanticBaselineAsync(client, token);
-        currentRuntime = currentRuntime with
-        {
-            ManagedProxyDefinitionHashes = CaptureManagedProxyDefinitionHashes(marker.RuntimeConfigPath)
-        };
-        return baseline.Runtime.SemanticallyEquals(currentRuntime);
+        if (baseline.Runtime.ManagedGroupExists && client is not IMihomoApplyClient)
+            return false;
+        var controller = client as IMihomoApplyClient;
+        await _runtimeConvergence.WaitAsync(
+            client,
+            runtime =>
+            {
+                var completeRuntime = runtime with
+                {
+                    ManagedProxyDefinitionHashes = CaptureManagedProxyDefinitionHashes(marker.RuntimeConfigPath)
+                };
+                var mismatch = ApplyEngine.GetRuntimeSemanticMismatch(baseline.Runtime, completeRuntime);
+                return (mismatch is null, mismatch);
+            },
+            async (runtime, retryToken) =>
+            {
+                if (controller is null || !baseline.Runtime.ManagedGroupExists || !runtime.ManagedGroupExists ||
+                    string.IsNullOrWhiteSpace(baseline.Runtime.ManagedGroupSelection) ||
+                    string.Equals(runtime.ManagedGroupSelection, baseline.Runtime.ManagedGroupSelection,
+                        StringComparison.Ordinal)) return;
+                try
+                {
+                    // store-selected 可能保留失败 Apply 的新选择；Recovery 必须主动选回旧 transport。
+                    await controller.SelectProxyAsync(
+                        RouteScriptBuilder.StaticGroupName,
+                        baseline.Runtime.ManagedGroupSelection,
+                        retryToken);
+                }
+                catch (MihomoControllerException ex) when (ex.StatusCode == 404)
+                {
+                    // Runtime 正在换代，下一次 live 采样继续判断。
+                }
+            },
+            token);
+        return true;
     }
 
     internal static IReadOnlyDictionary<string, string> CaptureManagedProxyDefinitionHashes(string runtimeConfigPath)

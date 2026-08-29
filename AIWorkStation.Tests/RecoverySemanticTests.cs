@@ -26,7 +26,8 @@ public sealed class RecoverySemanticTests
         var recovered = await new RecoveryService(
             reloader: new FakeReloadService(true),
             markers: markers,
-            pipeFactory: _ => differentRuntime).RecoverAsync(marker);
+            pipeFactory: _ => differentRuntime,
+            runtimeConvergence: FastConvergence()).RecoverAsync(marker);
 
         Assert.False(recovered);
         Assert.Equal("original extension", await File.ReadAllTextAsync(paths.Extension));
@@ -52,7 +53,8 @@ public sealed class RecoverySemanticTests
         var recovered = await new RecoveryService(
             reloader: new FakeReloadService(true),
             markers: markers,
-            pipeFactory: _ => runtime).RecoverAsync(marker);
+            pipeFactory: _ => runtime,
+            runtimeConvergence: FastConvergence()).RecoverAsync(marker);
 
         Assert.False(recovered);
         Assert.Equal("original extension", await File.ReadAllTextAsync(paths.Extension));
@@ -76,7 +78,8 @@ public sealed class RecoverySemanticTests
         var recovered = await new RecoveryService(
             reloader: new FakeReloadService(true),
             markers: markers,
-            pipeFactory: _ => runtime).RecoverAsync(marker);
+            pipeFactory: _ => runtime,
+            runtimeConvergence: FastConvergence()).RecoverAsync(marker);
 
         Assert.True(recovered);
         Assert.Equal("original extension", await File.ReadAllTextAsync(paths.Extension));
@@ -106,7 +109,8 @@ public sealed class RecoverySemanticTests
         var recovered = await new RecoveryService(
             reloader: reloader,
             markers: markers,
-            pipeFactory: _ => runtime).RecoverAsync(marker);
+            pipeFactory: _ => runtime,
+            runtimeConvergence: FastConvergence()).RecoverAsync(marker);
 
         Assert.True(recovered);
         Assert.Equal(RouteScriptBuilder.DialerStaticExitName, runtime.Selection);
@@ -135,7 +139,8 @@ public sealed class RecoverySemanticTests
         var recovered = await new RecoveryService(
             reloader: new FakeReloadService(true),
             markers: markers,
-            pipeFactory: _ => runtime).RecoverAsync(marker);
+            pipeFactory: _ => runtime,
+            runtimeConvergence: FastConvergence()).RecoverAsync(marker);
 
         Assert.False(recovered);
         Assert.Equal("original extension", await File.ReadAllTextAsync(paths.Extension));
@@ -162,6 +167,38 @@ public sealed class RecoverySemanticTests
         foreach (var key in first.Keys) Assert.Equal(first[key], reordered[key]);
         Assert.NotEqual(first[RouteScriptBuilder.DirectStaticExitName],
             changed[RouteScriptBuilder.DirectStaticExitName]);
+    }
+
+    [Fact]
+    public async Task Recovery_ControllerReadyEarly_WaitsUntilManagedRuntimeConverges()
+    {
+        using var temp = new TempDirectory();
+        var paths = await CreateEnvironmentAsync(temp, ScriptUid);
+        var baselineClient = new FakeRecoveryRuntimeClient();
+        var baseline = await RecoveryService.CaptureBaselineAsync(
+            paths.Profiles, paths.Extension, baselineClient);
+        var backup = await new BackupService(temp.File("backups")).BackupAsync([paths.Extension], baseline);
+        await File.WriteAllTextAsync(paths.Extension, "modified");
+
+        var markers = new TransactionMarkerService(temp.File("transaction.json"));
+        var marker = Marker(backup.Directory, paths.Extension, paths.Runtime);
+        await markers.WriteAsync(marker);
+        var delayedRuntime = new FakeRecoveryRuntimeClient
+        {
+            ManagedObjectsAvailableAfterConfigRequest = 3
+        };
+
+        var recovered = await new RecoveryService(
+            reloader: new FakeReloadService(true),
+            markers: markers,
+            pipeFactory: _ => delayedRuntime,
+            runtimeConvergence: new MihomoRuntimeConvergence(
+                TimeSpan.FromSeconds(1), TimeSpan.FromMilliseconds(5))).RecoverAsync(marker);
+
+        Assert.True(recovered);
+        Assert.True(delayedRuntime.ConfigRequests >= 3);
+        Assert.False(File.Exists(markers.MarkerPath));
+        Assert.False(Directory.Exists(backup.Directory));
     }
 
     [Fact]
@@ -386,6 +423,9 @@ public sealed class RecoverySemanticTests
     private static TransactionMarker Marker(string backupDirectory, string target, string runtimePath)
         => new("writing", backupDirectory, [target], "clash-verge.exe", runtimePath);
 
+    private static MihomoRuntimeConvergence FastConvergence()
+        => new(TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(5));
+
     private sealed class FakeRecoveryRuntimeClient : IMihomoApplyClient
     {
         public string Selection { get; set; } = RouteScriptBuilder.DirectStaticExitName;
@@ -399,6 +439,7 @@ public sealed class RecoverySemanticTests
         public int ProxyRequests { get; private set; }
         public int RuleRequests { get; private set; }
         public int SelectionCalls { get; private set; }
+        public int? ManagedObjectsAvailableAfterConfigRequest { get; init; }
 
         public Task PutInlineConfigAsync(string yamlPayload, CancellationToken token = default)
             => Task.CompletedTask;
@@ -421,6 +462,12 @@ public sealed class RecoverySemanticTests
         public Task<JsonDocument> GetConfigsAsync(CancellationToken token = default)
         {
             ConfigRequests++;
+            if (ManagedObjectsAvailableAfterConfigRequest is { } readyAt)
+            {
+                var available = ConfigRequests >= readyAt;
+                IncludeManagedObjects = available;
+                IncludeManagedRule = available;
+            }
             return Task.FromResult(JsonDocument.Parse(ConfigsJson));
         }
 

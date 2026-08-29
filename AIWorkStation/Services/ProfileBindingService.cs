@@ -10,6 +10,8 @@ public sealed record ProfileBindingPlan(string ScriptUid, string ScriptPath, byt
     public bool ProfilesChanged => UpdatedProfilesBytes is not null;
 }
 
+public sealed class ProfileBindingTargetChangedException(string message) : IOException(message);
+
 public sealed class ProfileBindingService
 {
     private const string Alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -62,6 +64,87 @@ public sealed class ProfileBindingService
         using var writer = new StringWriter(System.Globalization.CultureInfo.InvariantCulture);
         yaml.Save(writer, assignAnchors: false);
         return new(uid, scriptPath, new UTF8Encoding(false).GetBytes(writer.ToString().Replace("\r\n", "\n", StringComparison.Ordinal)));
+    }
+
+    public byte[]? PatchLatestProfiles(
+        string profilesPath,
+        string expectedCurrentUid,
+        ProfileBindingPlan binding)
+    {
+        using var reader = File.OpenText(profilesPath);
+        var yaml = new YamlStream();
+        yaml.Load(reader);
+        if (yaml.Documents.Count == 0 || yaml.Documents[0].RootNode is not YamlMappingNode root)
+            throw new InvalidDataException("profiles.yaml 根节点无效。");
+        if (Scalar(root, "current") != expectedCurrentUid)
+            throw new ProfileBindingTargetChangedException("Clash 退出后 Current Profile UID 已变化。");
+        if (!root.Children.TryGetValue(new YamlScalarNode("items"), out var itemsNode) || itemsNode is not YamlSequenceNode items)
+            throw new InvalidDataException("profiles.yaml.items 无效。");
+
+        var currentItems = items.Children.OfType<YamlMappingNode>()
+            .Where(item => Scalar(item, "uid") == expectedCurrentUid)
+            .ToArray();
+        if (currentItems.Length != 1)
+            throw new InvalidDataException("Clash 退出后无法唯一定位当前 Profile item。");
+
+        var changed = false;
+        var current = currentItems[0];
+        if (!current.Children.TryGetValue(new YamlScalarNode("option"), out var optionNode) ||
+            optionNode is not YamlMappingNode option)
+        {
+            option = new YamlMappingNode();
+            current.Children[new YamlScalarNode("option")] = option;
+            changed = true;
+        }
+        var currentScriptUid = Scalar(option, "script");
+        if (!string.IsNullOrWhiteSpace(currentScriptUid) &&
+            !string.Equals(currentScriptUid, binding.ScriptUid, StringComparison.Ordinal))
+            throw new ProfileBindingTargetChangedException("Clash 退出时当前 Profile 的 Script 绑定已被其他程序替换。");
+        if (currentScriptUid != binding.ScriptUid)
+        {
+            option.Children[new YamlScalarNode("script")] = new YamlScalarNode(binding.ScriptUid);
+            changed = true;
+        }
+
+        var scriptItems = items.Children.OfType<YamlMappingNode>()
+            .Where(item => Scalar(item, "uid") == binding.ScriptUid)
+            .ToArray();
+        if (scriptItems.Length > 1)
+            throw new InvalidDataException("profiles.yaml 中存在重复的 AI WorkStation Script UID。");
+
+        var expectedFile = Path.GetFileName(binding.ScriptPath);
+        if (scriptItems.Length == 0)
+        {
+            items.Add(new YamlMappingNode
+            {
+                { "uid", binding.ScriptUid },
+                { "type", "script" },
+                { "name", "AI WorkStation" },
+                { "file", expectedFile },
+                { "updated", DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture) }
+            });
+            changed = true;
+        }
+        else
+        {
+            var scriptItem = scriptItems[0];
+            if (!string.Equals(Scalar(scriptItem, "type"), "script", StringComparison.OrdinalIgnoreCase))
+                throw new ProfileBindingTargetChangedException("AI WorkStation Script UID 被非 Script 项占用。");
+            var existingFile = Scalar(scriptItem, "file");
+            if (!string.IsNullOrWhiteSpace(existingFile) &&
+                !string.Equals(existingFile, expectedFile, StringComparison.OrdinalIgnoreCase))
+                throw new ProfileBindingTargetChangedException("AI WorkStation Script UID 指向了其他文件。");
+            if (!string.Equals(existingFile, expectedFile, StringComparison.OrdinalIgnoreCase))
+            {
+                scriptItem.Children[new YamlScalarNode("file")] = new YamlScalarNode(expectedFile);
+                changed = true;
+            }
+        }
+
+        if (!changed) return null;
+        using var writer = new StringWriter(System.Globalization.CultureInfo.InvariantCulture);
+        yaml.Save(writer, assignAnchors: false);
+        return new UTF8Encoding(false).GetBytes(writer.ToString().Replace("\r\n", "\n", StringComparison.Ordinal));
     }
 
     public static string CreateScriptUid()

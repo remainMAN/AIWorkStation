@@ -22,6 +22,17 @@ public interface IMihomoApplyClient : IMihomoRuntimeClient
     Task<IReadOnlyList<RouteObservation>> GetRouteObservationsAsync(CancellationToken token = default);
 }
 
+public sealed class MihomoControllerException : IOException
+{
+    public MihomoControllerException(int statusCode, string message)
+        : base(message)
+    {
+        StatusCode = statusCode;
+    }
+
+    public int StatusCode { get; }
+}
+
 public sealed class MihomoNamedPipeClient : IMihomoApplyClient
 {
     private readonly string _pipeName;
@@ -46,7 +57,9 @@ public sealed class MihomoNamedPipeClient : IMihomoApplyClient
         var path = "/proxies/" + Uri.EscapeDataString(groupName);
         var response = await SendAsync("PUT", path, JsonSerializer.Serialize(new { name = proxyName }), token);
         if (response.StatusCode is < 200 or >= 300)
-            throw new IOException($"Mihomo 无法选择指定静态网络路径（HTTP {response.StatusCode}）。");
+            throw new MihomoControllerException(
+                response.StatusCode,
+                $"Mihomo 无法选择指定静态网络路径（HTTP {response.StatusCode}）。");
     }
 
     public async Task<int> GetProxyDelayAsync(string proxyName, CancellationToken token = default)
@@ -103,14 +116,18 @@ public sealed class MihomoNamedPipeClient : IMihomoApplyClient
         var body = JsonSerializer.Serialize(new { path = "", payload = yamlPayload });
         var response = await SendAsync("PUT", "/configs?force=true", body, token);
         if (response.StatusCode is < 200 or >= 300)
-            throw new IOException($"Mihomo 返回 HTTP {response.StatusCode}: {Limit(response.Body)}");
+            throw new MihomoControllerException(
+                response.StatusCode,
+                $"Mihomo 返回 HTTP {response.StatusCode}: {Limit(response.Body)}");
     }
 
     private async Task<JsonDocument> GetJsonAsync(string path, CancellationToken token)
     {
         var response = await SendAsync("GET", path, null, token);
         if (response.StatusCode is < 200 or >= 300)
-            throw new IOException($"Mihomo 返回 HTTP {response.StatusCode}: {Limit(response.Body)}");
+            throw new MihomoControllerException(
+                response.StatusCode,
+                $"Mihomo 返回 HTTP {response.StatusCode}: {Limit(response.Body)}");
         return JsonDocument.Parse(response.Body);
     }
 

@@ -81,8 +81,9 @@ public class StaticExitTester
         using var handler = CreateHandler(config);
         using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("AIWorkStation", "1.0"));
-        var lastFailure = FailureCode.ExitIpLookupFailed;
-        var lastDetail = "代理连接后未返回有效 IP。";
+        var providerFailureCount = 0;
+        var providerTimedOut = false;
+        var providerTransportFailed = false;
         foreach (var provider in _providers)
         {
             try
@@ -92,31 +93,69 @@ public class StaticExitTester
                 var value = (await client.GetStringAsync(provider, providerTimeout.Token)).Trim();
                 if (IPAddress.TryParse(value, out var ip))
                     return new(true, ip.ToString(), FailureCode.None, null);
-                lastFailure = FailureCode.ExitIpLookupFailed;
-                lastDetail = "Provider 未返回有效 IP。";
+                providerFailureCount++;
             }
             catch (ProxyAuthenticationException)
             {
                 return new(false, null, FailureCode.StaticProxyAuthenticationFailed, "代理认证被拒绝。");
             }
-            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.ProxyAuthenticationRequired)
+            catch (HttpRequestException ex) when (IsAuthenticationError(ex))
             {
-                return new(false, null, FailureCode.StaticProxyAuthenticationFailed, "HTTP 407");
+                return new(false, null, FailureCode.StaticProxyAuthenticationFailed, "代理认证被拒绝。");
+            }
+            catch (HttpRequestException ex) when (ex.HttpRequestError == HttpRequestError.ProxyTunnelError)
+            {
+                return new(false, null, FailureCode.StaticProxyConnectionFailed,
+                    "静态代理无法建立到公网出口查询服务的隧道连接。");
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode is not null)
+            {
+                // Provider 的 HTTP 错误不代表静态代理不可用；继续尝试下一个独立 Provider。
+                providerFailureCount++;
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // 单个 Provider 超时属于探测源不可用，不能据此判定代理超时。
+                providerFailureCount++;
+                providerTimedOut = true;
             }
             catch (Exception ex) when (ex is HttpRequestException or IOException or SocketException)
             {
                 if (IsAuthenticationError(ex))
                     return new(false, null, FailureCode.StaticProxyAuthenticationFailed, "代理认证被拒绝。");
-                lastFailure = FailureCode.StaticProxyConnectionFailed;
-                lastDetail = Sanitize(ex.Message, config);
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-            {
-                lastFailure = FailureCode.StaticProxyTimeout;
-                lastDetail = "静态代理请求超时。";
+                providerFailureCount++;
+                providerTransportFailed = true;
             }
         }
-        return new(false, null, lastFailure, lastDetail);
+        if (providerTransportFailed)
+            return new(false, null, FailureCode.StaticProxyConnectionFailed,
+                "静态代理无法连接任一公网出口查询服务。");
+        if (providerTimedOut &&
+            !await IsProxyEndpointReachableAsync(config.Server, config.Port, cancellationToken))
+            return new(false, null, FailureCode.StaticProxyConnectionFailed, "无法连接静态代理服务器。");
+
+        return new(false, null, FailureCode.ExitIpLookupFailed,
+            $"静态代理端点可达，但 {providerFailureCount}/{_providers.Count} 个出口 IP Provider 均不可用。");
+    }
+
+    private static async Task<bool> IsProxyEndpointReachableAsync(string server, int port, CancellationToken token)
+    {
+        using var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(2));
+        try
+        {
+            await socket.ConnectAsync(server, port, timeout.Token);
+            return true;
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception ex) when (ex is SocketException or IOException)
+        {
+            return false;
+        }
     }
 
     internal static StaticExitTestResult AssessSamples(
@@ -150,6 +189,9 @@ public class StaticExitTester
         }
 
         var failures = samples.Select(item => item.Result).Where(result => !result.Success).ToArray();
+        if (failures.Length > 0 && failures.All(result => result.FailureCode == FailureCode.ExitIpLookupFailed))
+            return new(false, null, FailureCode.ExitIpLookupFailed, failures[0].SanitizedDetail);
+
         var failureCode = failures.Any(result => result.FailureCode == FailureCode.StaticProxyTimeout)
             ? FailureCode.StaticProxyTimeout
             : failures.Any(result => result.FailureCode == FailureCode.StaticProxyConnectionFailed)
@@ -267,7 +309,16 @@ public class StaticExitTester
     }
 
     private static bool IsAuthenticationError(Exception exception)
-        => exception is ProxyAuthenticationException || exception.InnerException is not null && IsAuthenticationError(exception.InnerException);
+        => exception is ProxyAuthenticationException ||
+           exception is HttpRequestException
+           {
+               HttpRequestError: HttpRequestError.UserAuthenticationError
+           } ||
+           exception is HttpRequestException
+           {
+               StatusCode: HttpStatusCode.ProxyAuthenticationRequired
+           } ||
+           exception.InnerException is not null && IsAuthenticationError(exception.InnerException);
 
     private static string Sanitize(string detail, StaticExitConfig config)
     {

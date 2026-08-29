@@ -298,7 +298,7 @@ public sealed class ApplyEngineIntegrationTests
         using var fixture = await ApplyFixture.CreateAsync(existingManagedScript: true);
         fixture.Pipe.OnConfigRequest = request =>
         {
-            if (request == 3) fixture.Pipe.Selection = RouteScriptBuilder.DialerStaticExitName;
+            if (request == 4) fixture.Pipe.Selection = RouteScriptBuilder.DialerStaticExitName;
         };
 
         var result = await fixture.ApplyAsync();
@@ -496,7 +496,6 @@ public sealed class ApplyEngineIntegrationTests
 
     [Theory]
     [InlineData(FailureCode.ExitIpMismatch, "203.0.113.45")]
-    [InlineData(FailureCode.ExitIpLookupFailed, null)]
     public async Task PostWrite_ExitFailure_Recovers(FailureCode code, string? actualIp)
     {
         using var fixture = await ApplyFixture.CreateAsync();
@@ -505,6 +504,40 @@ public sealed class ApplyEngineIntegrationTests
         Assert.False(result.Success);
         Assert.True(result.RecoveryAttempted);
         Assert.True(result.RecoverySucceeded);
+    }
+
+    [Fact]
+    public async Task PostWrite_AllProvidersUnavailable_ReusesPrewriteExitAndContinuesRouteVerification()
+    {
+        using var fixture = await ApplyFixture.CreateAsync();
+        fixture.LocalExit.Result = new(
+            false, null, FailureCode.ExitIpLookupFailed, "fixture providers unavailable");
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.True(result.Success);
+        Assert.Equal("203.0.113.44", result.ActualExitIp);
+        Assert.False(result.RecoveryAttempted);
+        Assert.Contains("查询服务暂时不可用", result.SanitizedDetail, StringComparison.Ordinal);
+        Assert.Equal(1, fixture.RouteVerifier.Calls);
+    }
+
+    [Fact]
+    public async Task Dialer_AllProvidersUnavailable_ReusesExitConfirmedDuringThisPrewrite()
+    {
+        using var fixture = await ApplyFixture.CreateAsync(
+            mode: StaticTransportMode.DialerProxy,
+            expectedExitIp: string.Empty);
+        fixture.LocalExit.Result = new(
+            false, null, FailureCode.ExitIpLookupFailed, "fixture providers unavailable");
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.True(result.Success);
+        Assert.Equal("203.0.113.44", result.ActualExitIp);
+        Assert.Equal(StaticTransportMode.DialerProxy, result.TransportMode);
+        Assert.False(result.RecoveryAttempted);
+        Assert.Equal(1, fixture.RouteVerifier.Calls);
     }
 
     [Fact]
@@ -518,9 +551,140 @@ public sealed class ApplyEngineIntegrationTests
         Assert.Equal(1, fixture.Reloader.RestartCalls);
     }
 
+    [Fact]
+    public async Task ShutdownOverwrite_IsPatchedAfterStop_AndPreservesLatestFields()
+    {
+        using var fixture = await ApplyFixture.CreateAsync();
+        fixture.Reloader.AfterProcessesStopped = () => File.WriteAllText(fixture.ProfilesPath, """
+            current: current
+            shutdown-field: preserved
+            items:
+              - uid: current
+                type: remote
+                name: 主策略
+                file: current.yaml
+                option: {}
+            """);
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.True(result.Success);
+        var profilesText = await File.ReadAllTextAsync(fixture.ProfilesPath);
+        Assert.Contains("shutdown-field: preserved", profilesText, StringComparison.Ordinal);
+        var profiles = new YamlDotNet.Serialization.DeserializerBuilder()
+            .IgnoreUnmatchedProperties().Build().Deserialize<ProfilesDocument>(profilesText);
+        Assert.Equal(ApplyFixture.ScriptUid, profiles.Items.Single(item => item.Uid == "current").Option?.Script);
+        Assert.Single(profiles.Items, item => item.Uid == ApplyFixture.ScriptUid);
+        Assert.Equal(2, fixture.Writer.SuccessfulWrites);
+    }
+
+    [Fact]
+    public async Task ShutdownOverwrite_FinalPatch_IsCoveredByRecoveryManifest()
+    {
+        using var fixture = await ApplyFixture.CreateAsync();
+        var originalProfiles = await File.ReadAllTextAsync(fixture.ProfilesPath);
+        fixture.Reloader.AfterProcessesStopped = () => File.WriteAllText(fixture.ProfilesPath, """
+            current: current
+            shutdown-field: transient
+            items:
+              - uid: current
+                type: remote
+                name: 主策略
+                file: current.yaml
+                option: {}
+            """);
+        fixture.RouteVerifier.Result = new(
+            false, FailureCode.ApplicationRouteMismatch, "fixture wrong route", []);
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.False(result.Success);
+        Assert.True(result.RecoveryAttempted);
+        Assert.True(result.RecoverySucceeded);
+        Assert.Equal(originalProfiles, await File.ReadAllTextAsync(fixture.ProfilesPath));
+        Assert.False(File.Exists(fixture.MarkerPath));
+    }
+
+    [Fact]
+    public async Task ShutdownTargetChanged_RestoresOnlyAiwsWrite_AndPreservesLatestProfiles()
+    {
+        using var fixture = await ApplyFixture.CreateAsync();
+        var originalScript = await File.ReadAllTextAsync(fixture.ScriptPath);
+        fixture.Reloader.AfterProcessesStopped = () => File.WriteAllText(fixture.ProfilesPath, """
+            current: external-current
+            shutdown-field: external-latest
+            items:
+              - uid: external-current
+                type: remote
+                name: External Profile
+                file: external.yaml
+                option: {}
+            """);
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.False(result.Success);
+        Assert.Equal(FailureCode.TargetChanged, result.FailureCode);
+        Assert.True(result.RecoveryAttempted);
+        Assert.True(result.RecoverySucceeded);
+        Assert.Equal(originalScript, await File.ReadAllTextAsync(fixture.ScriptPath));
+        var latestProfiles = await File.ReadAllTextAsync(fixture.ProfilesPath);
+        Assert.Contains("current: external-current", latestProfiles, StringComparison.Ordinal);
+        Assert.Contains("shutdown-field: external-latest", latestProfiles, StringComparison.Ordinal);
+        Assert.False(File.Exists(fixture.MarkerPath));
+    }
+
+    [Fact]
+    public async Task DirectMode_SlowRuntimeStartup_ConvergesAndKeepsExpectedExit()
+    {
+        using var fixture = await ApplyFixture.CreateAsync(mode: StaticTransportMode.Direct);
+        fixture.Pipe.ReloadActivationDelaySnapshots = 2;
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.True(result.Success);
+        Assert.Equal(StaticTransportMode.Direct, result.TransportMode);
+        Assert.Equal("203.0.113.44", result.ActualExitIp);
+        Assert.Contains(fixture.Pipe.Selections, selection =>
+            selection.Proxy == RouteScriptBuilder.DirectStaticExitName);
+    }
+
+    [Fact]
+    public async Task DialerMode_SlowRuntimeStartup_ConvergesAndKeepsChainSelection()
+    {
+        using var fixture = await ApplyFixture.CreateAsync(mode: StaticTransportMode.DialerProxy);
+        fixture.Pipe.ReloadActivationDelaySnapshots = 2;
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.True(result.Success);
+        Assert.Equal(StaticTransportMode.DialerProxy, result.TransportMode);
+        Assert.Equal("203.0.113.44", result.ActualExitIp);
+        Assert.Contains(fixture.Pipe.Selections, selection =>
+            selection.Proxy == RouteScriptBuilder.DialerStaticExitName);
+    }
+
+    [Fact]
+    public async Task PostReload_Transient503And504_DoNotTriggerRecovery()
+    {
+        using var fixture = await ApplyFixture.CreateAsync();
+        fixture.Reloader.AfterCandidateActivated = () =>
+        {
+            fixture.Pipe.ConfigFailures.Enqueue(new MihomoControllerException(503, "fixture 503"));
+            fixture.Pipe.ConfigFailures.Enqueue(new MihomoControllerException(504, "fixture 504"));
+        };
+
+        var result = await fixture.ApplyAsync();
+
+        Assert.True(result.Success);
+        Assert.False(result.RecoveryAttempted);
+        Assert.Equal(1, fixture.Reloader.RestartCalls);
+        Assert.Empty(fixture.Pipe.ConfigFailures);
+    }
+
     private sealed class ApplyFixture : IDisposable
     {
-        private const string ScriptUid = "sManaged00001";
+        internal const string ScriptUid = "sManaged00001";
         private readonly TempDirectory _temp;
         private readonly ApplyContext _context;
         private readonly ApplyEngine _engine;
@@ -700,7 +864,9 @@ public sealed class ApplyEngineIntegrationTests
             };
             var reloader = new SequencedReloadService(runtimePath, runtimeBaselineYaml, pipe);
             var markers = new TransactionMarkerService(markerPath);
-            var recovery = new RecoveryService(writer, reloader, markers, _ => pipe);
+            var convergence = new MihomoRuntimeConvergence(
+                TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(5));
+            var recovery = new RecoveryService(writer, reloader, markers, _ => pipe, convergence);
             var engine = new ApplyEngine(
                 mihomoValidator: new AlwaysValidMihomoValidator(temp.File("validation")),
                 backupService: new BackupService(backupRoot),
@@ -712,7 +878,8 @@ public sealed class ApplyEngineIntegrationTests
                 staticExitTester: staticExit,
                 localExitTester: localExit,
                 pipeFactory: _ => pipe,
-                environmentCheck: (_, _, _) => { });
+                environmentCheck: (_, _, _) => { },
+                runtimeConvergence: convergence);
             return new ApplyFixture(temp, context, engine, pipe, staticExit, localExit,
                 writer, reloader, routeVerifier, scriptPath, profilesPath, runtimePath,
                 markerPath, backupRoot, events);
@@ -798,6 +965,8 @@ public sealed class ApplyEngineIntegrationTests
     {
         public int RestartCalls { get; private set; }
         public Func<string, string>? CandidateTransform { get; set; }
+        public Action? AfterProcessesStopped { get; set; }
+        public Action? AfterCandidateActivated { get; set; }
 
         public override async Task<bool> RestartAsync(
             string clashExecutable,
@@ -818,11 +987,28 @@ public sealed class ApplyEngineIntegrationTests
             }
             return true;
         }
+
+        public override async Task<bool> RestartAsync(
+            string clashExecutable,
+            string runtimeConfigPath,
+            Func<CancellationToken, Task> afterProcessesStopped,
+            CancellationToken token = default)
+        {
+            RestartCalls++;
+            AfterProcessesStopped?.Invoke();
+            await afterProcessesStopped(token);
+            var runtime = CandidateTransform?.Invoke(pipe.LastCandidateYaml) ?? pipe.LastCandidateYaml;
+            await File.WriteAllTextAsync(runtimePath, runtime, token);
+            pipe.ActivateCandidate();
+            AfterCandidateActivated?.Invoke();
+            return true;
+        }
     }
 
     private sealed class StubRouteVerifier : RouteVerifier
     {
         public RouteVerifyResult Result { get; set; } = new(true, FailureCode.None, string.Empty, []);
+        public int Calls { get; private set; }
 
         public override Task<RouteVerifyResult> VerifyAsync(
             IMihomoApplyClient client,
@@ -831,7 +1017,10 @@ public sealed class ApplyEngineIntegrationTests
             string? selectedExit = null,
             IProgress<string>? progress = null,
             CancellationToken token = default)
-            => Task.FromResult(Result);
+        {
+            Calls++;
+            return Task.FromResult(Result);
+        }
     }
 
     private sealed class FakeApplyRuntimeClient : IMihomoApplyClient
@@ -841,6 +1030,7 @@ public sealed class ApplyEngineIntegrationTests
         private bool _managed;
         private readonly bool _baselineManaged;
         private readonly string _baselineSelection;
+        private int _unmanagedSnapshotsRemaining;
 
         public FakeApplyRuntimeClient(string originalYaml, bool baselineManaged, List<string> events)
         {
@@ -866,6 +1056,8 @@ public sealed class ApplyEngineIntegrationTests
         public List<string> InlinePayloads { get; } = [];
         public List<(string Group, string Proxy)> Selections { get; } = [];
         public string Selection { get; set; }
+        public int ReloadActivationDelaySnapshots { get; set; }
+        public Queue<Exception> ConfigFailures { get; } = new();
 
         public Task PutInlineConfigAsync(string yamlPayload, CancellationToken token = default)
         {
@@ -912,6 +1104,8 @@ public sealed class ApplyEngineIntegrationTests
         {
             ConfigRequests++;
             OnConfigRequest?.Invoke(ConfigRequests);
+            if (ConfigFailures.TryDequeue(out var failure))
+                return Task.FromException<JsonDocument>(failure);
             return Document(new { mode = "rule", generation = Generation });
         }
 
@@ -950,12 +1144,16 @@ public sealed class ApplyEngineIntegrationTests
             object[] rules = _managed
                 ? [new { type = "ProcessName", payload = "codex.exe", proxy = RouteScriptBuilder.StaticGroupName }]
                 : [new { type = "Match", payload = "", proxy = "DIRECT" }];
-            return Document(new { rules });
+            var result = Document(new { rules });
+            if (_unmanagedSnapshotsRemaining > 0 && --_unmanagedSnapshotsRemaining == 0)
+                _managed = true;
+            return result;
         }
 
         public void ActivateCandidate()
         {
-            _managed = true;
+            _unmanagedSnapshotsRemaining = ReloadActivationDelaySnapshots;
+            _managed = _unmanagedSnapshotsRemaining == 0;
         }
 
         public void RestoreBaseline()

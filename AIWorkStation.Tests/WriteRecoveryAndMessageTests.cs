@@ -115,6 +115,30 @@ public sealed class WriteRecoveryAndMessageTests
     }
 
     [Fact]
+    public async Task RecoveryRestoresOnlyTargetsCoveredByTransactionMarker()
+    {
+        using var temp = new TempDirectory();
+        var script = temp.File("script.js");
+        var profiles = temp.File("profiles.yaml");
+        await File.WriteAllTextAsync(script, "old script");
+        await File.WriteAllTextAsync(profiles, "old profiles");
+        var backup = await new BackupService(temp.File("backups")).BackupAsync([script, profiles]);
+        await File.WriteAllTextAsync(script, "aiws write");
+        await File.WriteAllTextAsync(profiles, "external latest profiles");
+        var markerService = new TransactionMarkerService(temp.File("transaction.json"));
+        var marker = new TransactionMarker(
+            "writing", backup.Directory, [script], "clash.exe", "runtime.yaml");
+        await markerService.WriteAsync(marker);
+
+        var recovered = await new RecoveryService(
+            reloader: new FakeReloadService(true), markers: markerService).RecoverAsync(marker);
+
+        Assert.True(recovered);
+        Assert.Equal("old script", await File.ReadAllTextAsync(script));
+        Assert.Equal("external latest profiles", await File.ReadAllTextAsync(profiles));
+    }
+
+    [Fact]
     public void EveryFailureCodeHasChineseMessage()
     {
         var mapper = new UserMessageMapper();

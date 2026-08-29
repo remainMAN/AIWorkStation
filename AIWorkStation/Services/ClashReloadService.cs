@@ -4,12 +4,30 @@ namespace AIWorkStation.Services;
 
 public class ClashReloadService
 {
-    public virtual async Task<bool> RestartAsync(string clashExecutable, string runtimeConfigPath, CancellationToken token = default)
+    public virtual Task<bool> RestartAsync(
+        string clashExecutable,
+        string runtimeConfigPath,
+        CancellationToken token = default)
+        => RestartCoreAsync(clashExecutable, runtimeConfigPath, afterProcessesStopped: null, token);
+
+    public virtual Task<bool> RestartAsync(
+        string clashExecutable,
+        string runtimeConfigPath,
+        Func<CancellationToken, Task> afterProcessesStopped,
+        CancellationToken token = default)
+        => RestartCoreAsync(clashExecutable, runtimeConfigPath, afterProcessesStopped, token);
+
+    private static async Task<bool> RestartCoreAsync(
+        string clashExecutable,
+        string runtimeConfigPath,
+        Func<CancellationToken, Task>? afterProcessesStopped,
+        CancellationToken token)
     {
         var installDirectory = Path.GetDirectoryName(Path.GetFullPath(clashExecutable));
         if (installDirectory is null || !File.Exists(clashExecutable)) return false;
         await StopMatchingProcessesAsync("clash-verge", installDirectory, graceful: true, token);
         await StopMatchingProcessesAsync("verge-mihomo", installDirectory, graceful: false, token);
+        if (afterProcessesStopped is not null) await afterProcessesStopped(token);
 
         Process.Start(new ProcessStartInfo
         {
@@ -35,8 +53,9 @@ public class ClashReloadService
                     using var config = await new MihomoNamedPipeClient(settings.ControllerPipe, TimeSpan.FromSeconds(2)).GetConfigsAsync(token);
                     return config.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object;
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or TimeoutException or InvalidDataException or
-                                            ArgumentException or OperationCanceledException)
+                catch (Exception ex) when (
+                    MihomoRuntimeConvergence.IsTransient(ex, token, includeInvalidRuntimeSample: true) ||
+                    ex is ArgumentException or YamlDotNet.Core.YamlException)
                 {
                     if (token.IsCancellationRequested) throw;
                 }
@@ -67,6 +86,8 @@ public class ClashReloadService
                 try { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(token); } catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }
             }
         }
+        if (Process.GetProcessesByName(name).Any(process => IsInDirectoryAndDispose(process, installDirectory)))
+            throw new IOException($"{name} 未能完全停止，已取消写入停机后的 profiles.yaml 补丁。");
     }
 
     private static bool IsInDirectoryAndDispose(Process process, string directory)

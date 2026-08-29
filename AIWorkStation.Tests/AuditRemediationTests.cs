@@ -242,12 +242,12 @@ public sealed class AuditRemediationTests
     }
 
     [Fact]
-    public async Task DialerProxy_DelayOnlyIsNotSufficient()
+    public async Task DialerProxy_MissingLocalIngressIsConnectionFailure()
     {
         var result = await new MihomoLocalProxyExitTester([new Uri("http://ip.test")], TimeSpan.FromMilliseconds(100))
             .TestAsync(1, null, null, null);
         Assert.False(result.Success);
-        Assert.Equal(FailureCode.ExitIpLookupFailed, result.FailureCode);
+        Assert.Equal(FailureCode.StaticProxyConnectionFailed, result.FailureCode);
     }
 
     [Fact]

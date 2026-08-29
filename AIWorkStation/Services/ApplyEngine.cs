@@ -20,6 +20,7 @@ public sealed class ApplyEngine
     private readonly RouteVerifier _routeVerifier;
     private readonly StaticExitTester _staticExitTester;
     private readonly MihomoLocalProxyExitTester _localExitTester;
+    private readonly MihomoRuntimeConvergence _runtimeConvergence;
     private readonly Func<string, IMihomoApplyClient> _pipeFactory;
     private readonly Action<ApplyContext, ClashInfo, SubscriptionInfo> _environmentCheck;
 
@@ -37,7 +38,8 @@ public sealed class ApplyEngine
         StaticExitTester? staticExitTester = null,
         MihomoLocalProxyExitTester? localExitTester = null,
         Func<string, IMihomoApplyClient>? pipeFactory = null,
-        Action<ApplyContext, ClashInfo, SubscriptionInfo>? environmentCheck = null)
+        Action<ApplyContext, ClashInfo, SubscriptionInfo>? environmentCheck = null,
+        MihomoRuntimeConvergence? runtimeConvergence = null)
     {
         _scriptBuilder = scriptBuilder ?? new RouteScriptBuilder();
         _scriptValidator = scriptValidator ?? new ScriptValidator();
@@ -50,8 +52,10 @@ public sealed class ApplyEngine
         _routeVerifier = routeVerifier ?? new RouteVerifier();
         _staticExitTester = staticExitTester ?? new StaticExitTester();
         _localExitTester = localExitTester ?? new MihomoLocalProxyExitTester();
+        _runtimeConvergence = runtimeConvergence ?? new MihomoRuntimeConvergence();
         _pipeFactory = pipeFactory ?? (path => new MihomoNamedPipeClient(path));
-        _recovery = recovery ?? new RecoveryService(_writer, _reloader, _markers, path => _pipeFactory(path));
+        _recovery = recovery ?? new RecoveryService(
+            _writer, _reloader, _markers, path => _pipeFactory(path), _runtimeConvergence);
         _environmentCheck = environmentCheck ?? Check;
     }
 
@@ -63,6 +67,7 @@ public sealed class ApplyEngine
     {
         var stage = "Check";
         var persistentWriteCount = 0;
+        var persistentWriteTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var markerWritten = false;
         string? backupDirectory = null;
         TransactionMarker? marker = null;
@@ -91,10 +96,16 @@ public sealed class ApplyEngine
             var staticExit = await _staticExitTester.TestAsync(effectiveRoute.StaticExit, token);
             if (staticExit.FailureCode == FailureCode.StaticProxyAuthenticationFailed)
                 throw new ApplyFailure(staticExit.FailureCode, "用户名或密码验证失败。请检查静态代理的用户名和密码。");
+            var providerUnavailableWithKnownExit =
+                !staticExit.Success &&
+                staticExit.FailureCode == FailureCode.ExitIpLookupFailed &&
+                !string.IsNullOrWhiteSpace(actualExitIp);
+            if (providerUnavailableWithKnownExit)
+                progress?.Report("公网出口查询服务暂时不可用；继续沿用本次应用前已确认的静态出口。");
 
             if (effectiveRoute.TransportMode == StaticTransportMode.Direct)
             {
-                if (!staticExit.Success)
+                if (!staticExit.Success && !providerUnavailableWithKnownExit)
                 {
                     if (IsNetworkFailure(staticExit.FailureCode) &&
                         effectiveRoute.TransportPreference == StaticTransportPreference.Auto &&
@@ -111,7 +122,7 @@ public sealed class ApplyEngine
                             staticExit.SanitizedDetail ?? "静态代理直连验证失败。");
                     }
                 }
-                else
+                else if (staticExit.Success)
                 {
                     actualExitIp = staticExit.ActualExitIp;
                     EnsureExpectedExit(effectiveRoute.ActualExitIp, actualExitIp);
@@ -119,7 +130,8 @@ public sealed class ApplyEngine
                         progress?.Report(staticExit.SanitizedDetail);
                 }
             }
-            else if (!staticExit.Success && !IsNetworkFailure(staticExit.FailureCode))
+            else if (!staticExit.Success && !providerUnavailableWithKnownExit &&
+                     !IsNetworkFailure(staticExit.FailureCode))
             {
                 throw new ApplyFailure(staticExit.FailureCode,
                     staticExit.SanitizedDetail ?? "静态代理验证失败。");
@@ -127,6 +139,12 @@ public sealed class ApplyEngine
             else if (!staticExit.Success)
             {
                 progress?.Report("直连不可用，正在通过当前 Clash 节点验证静态出口…");
+            }
+            else
+            {
+                // 即使最终选择 Dialer，本轮直测得到的 ActualExitIp 仍是可复用的写前确认事实。
+                actualExitIp = staticExit.ActualExitIp;
+                EnsureExpectedExit(effectiveRoute.ActualExitIp, actualExitIp);
             }
 
             var script = _scriptBuilder.Build(effectiveRoute);
@@ -167,8 +185,9 @@ public sealed class ApplyEngine
             {
                 var runtimeExit = await ValidateTemporaryRuntimeAsync(
                     clash, subscription, effectiveRoute,
-                    originalRuntimeSha256, candidates.RuntimeCandidate, progress, token);
-                if (effectiveRoute.TransportMode == StaticTransportMode.DialerProxy)
+                    originalRuntimeSha256, candidates.RuntimeCandidate, actualExitIp, progress, token);
+                if (effectiveRoute.TransportMode == StaticTransportMode.DialerProxy &&
+                    !string.IsNullOrWhiteSpace(runtimeExit))
                     actualExitIp = runtimeExit;
             }
 
@@ -182,17 +201,20 @@ public sealed class ApplyEngine
             }
             if (sameScript)
             {
+                stage = "Verify";
                 RecheckTargets(context, binding);
-                var currentRuntime = await RecoveryService.CaptureRuntimeSemanticBaselineAsync(
-                    _pipeFactory(clash.ControllerPipe), token);
-                currentRuntime = currentRuntime with
+                try
                 {
-                    ManagedProxyDefinitionHashes = RecoveryService.CaptureManagedProxyDefinitionHashes(
-                        clash.RuntimeConfigPath)
-                };
-                if (!RuntimeMatchesRoute(currentRuntime, effectiveRoute, expectedDefinitionHashes))
+                    await WaitForRouteRuntimeAsync(
+                        _pipeFactory(clash.ControllerPipe), effectiveRoute, token, reconcileSelection: false);
+                    await WaitForPersistedRuntimeDefinitionsAsync(
+                        clash.RuntimeConfigPath, expectedDefinitionHashes, token);
+                }
+                catch (MihomoRuntimeConvergenceException ex)
+                {
                     throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
-                        "磁盘 Script 已是最新版本，但当前 Mihomo Runtime 尚未加载同一受管配置，请重新检查环境。");
+                        "磁盘 Script 已是最新版本，但当前 Mihomo Runtime 未收敛：" + ex.Message);
+                }
                 progress?.Report("当前配置已经是最新状态。");
                 return ApplyResult.Ok(actualExitIp, effectiveRoute.TransportMode,
                     filesModified: false, noChangesRequired: true);
@@ -203,9 +225,11 @@ public sealed class ApplyEngine
             RecoveryBaseline recoveryBaseline;
             try
             {
-                recoveryBaseline = await RecoveryService.CaptureBaselineAsync(
-                    clash.ProfilesPath, binding.ScriptPath, clash.RuntimeConfigPath,
-                    _pipeFactory(clash.ControllerPipe), token);
+                recoveryBaseline = await _runtimeConvergence.ExecuteAsync(
+                    retryToken => RecoveryService.CaptureBaselineAsync(
+                        clash.ProfilesPath, binding.ScriptPath, clash.RuntimeConfigPath,
+                        _pipeFactory(clash.ControllerPipe), retryToken),
+                    token);
             }
             catch (Exception ex) when (ex is IOException or TimeoutException or InvalidDataException or JsonException)
             {
@@ -213,8 +237,8 @@ public sealed class ApplyEngine
                     "无法记录恢复所需的原运行配置语义：" + ex.Message);
             }
 
-            var targets = new List<string> { binding.ScriptPath };
-            if (binding.ProfilesChanged) targets.Add(clash.ProfilesPath);
+            // profiles.yaml 可能在 Clash 正常退出时被最终保存覆盖；它必须始终进入同一备份/事务范围。
+            var targets = new List<string> { binding.ScriptPath, clash.ProfilesPath };
             try
             {
                 var backup = await _backupService.BackupAsync(targets, recoveryBaseline, token);
@@ -227,7 +251,7 @@ public sealed class ApplyEngine
 
             RecheckTargets(context, binding);
             marker = new TransactionMarker(
-                "writing", backupDirectory, targets,
+                "writing", backupDirectory, [binding.ScriptPath],
                 clash.ClashProcess.ExecutablePath, clash.RuntimeConfigPath);
             await _markers.WriteAsync(marker, token);
             markerWritten = true;
@@ -236,42 +260,64 @@ public sealed class ApplyEngine
             progress?.Report("正在安全写入静态分流配置…");
             await _writer.WriteAsync(binding.ScriptPath, scriptBytes, token);
             persistentWriteCount++;
-            if (binding.UpdatedProfilesBytes is not null)
-            {
-                await _writer.WriteAsync(clash.ProfilesPath, binding.UpdatedProfilesBytes, token);
-                persistentWriteCount++;
-            }
+            persistentWriteTargets.Add(binding.ScriptPath);
 
             stage = "Reload";
             progress?.Report("正在受控重启 Clash Verge Rev…");
-            if (!await _reloader.RestartAsync(clash.ClashProcess.ExecutablePath, clash.RuntimeConfigPath, token))
-                throw new ApplyFailure(FailureCode.ReloadFailed,
-                    "Clash Verge 或 verge-mihomo 未在等待时间内恢复运行。");
+            try
+            {
+                if (!await _reloader.RestartAsync(
+                        clash.ClashProcess.ExecutablePath,
+                        clash.RuntimeConfigPath,
+                        async shutdownToken =>
+                        {
+                            // Clash 已完全退出后重读最新 profiles.yaml，只补本次受管绑定并保留退出时保存的其他字段。
+                            var patchedProfiles = _bindingService.PatchLatestProfiles(
+                                clash.ProfilesPath, subscription.Uid, binding);
+                            if (patchedProfiles is null) return;
+                            // Crash recovery must cover profiles.yaml before its atomic replacement starts,
+                            // while earlier failures must not roll back a file AIWS never wrote.
+                            marker = marker! with { Targets = targets };
+                            await _markers.WriteAsync(marker, shutdownToken);
+                            await _writer.WriteAsync(clash.ProfilesPath, patchedProfiles, shutdownToken);
+                            persistentWriteCount++;
+                            persistentWriteTargets.Add(clash.ProfilesPath);
+                        },
+                        token))
+                    throw new ApplyFailure(FailureCode.ReloadFailed,
+                        "Clash Verge 或 verge-mihomo 未在等待时间内恢复运行。");
+            }
+            catch (ProfileBindingTargetChangedException ex)
+            {
+                throw new ApplyFailure(FailureCode.TargetChanged, ex.Message);
+            }
 
             stage = "Verify";
             progress?.Report("正在验证写入后的有效配置与目标程序路由…");
-            if (!VerifyPersisted(clash, subscription.Uid, binding, effectiveRoute))
+            var persistedMismatch = GetPersistedMismatch(clash, subscription.Uid, binding, scriptBytes);
+            if (persistedMismatch is not null)
                 throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
-                    "Extension 绑定或有效配置验证失败。");
+                    persistedMismatch);
             var livePipePath = ClashVergeDetector.ReadRuntimeSettings(clash.RuntimeConfigPath).ControllerPipe;
             var livePipe = _pipeFactory(livePipePath);
             var selectedExit = RouteScriptBuilder.SelectedExitName(effectiveRoute);
-            await livePipe.SelectProxyAsync(RouteScriptBuilder.StaticGroupName, selectedExit, token);
-            var liveRuntime = await RecoveryService.CaptureRuntimeSemanticBaselineAsync(livePipe, token);
-            liveRuntime = liveRuntime with
+            try
             {
-                ManagedProxyDefinitionHashes = RecoveryService.CaptureManagedProxyDefinitionHashes(
-                    clash.RuntimeConfigPath)
-            };
-            if (!RuntimeMatchesRoute(liveRuntime, effectiveRoute, expectedDefinitionHashes))
+                await WaitForRouteRuntimeAsync(livePipe, effectiveRoute, token);
+                await WaitForPersistedRuntimeDefinitionsAsync(
+                    clash.RuntimeConfigPath, expectedDefinitionHashes, token);
+            }
+            catch (MihomoRuntimeConvergenceException ex)
+            {
                 throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
-                    "写入后的受管代理定义、成员、选择或程序规则与本次配置不一致。");
+                    "写入后的正式 Runtime 未在限定时间内收敛：" + ex.Message);
+            }
 
             // 写入后重新查询实际公网出口，防止策略组名称正确但底层代理仍是旧配置。
             // 探针只在现有 Verify 阶段临时加入公网查询域名规则，随后恢复并复核正式 Runtime。
             var expectedPostWriteExit = actualExitIp ?? effectiveRoute.ActualExitIp;
             var postWriteExit = await VerifyPostWriteExitAsync(
-                clash, effectiveRoute, livePipe, expectedDefinitionHashes,
+                clash, effectiveRoute, livePipe,
                 string.IsNullOrWhiteSpace(expectedPostWriteExit) ? null : expectedPostWriteExit,
                 token);
             if (!postWriteExit.Success || string.IsNullOrWhiteSpace(postWriteExit.ActualExitIp) ||
@@ -290,7 +336,8 @@ public sealed class ApplyEngine
             TryDeleteDirectory(backupDirectory);
             backupDirectory = null;
             return ApplyResult.Ok(actualExitIp, effectiveRoute.TransportMode,
-                detail: liveRoute.Detail, applicationResults: liveRoute.ApplicationResults);
+                detail: CombineDetails(postWriteExit.SanitizedDetail, liveRoute.Detail),
+                applicationResults: liveRoute.ApplicationResults);
         }
         catch (ApplyFailure failure)
         {
@@ -302,14 +349,16 @@ public sealed class ApplyEngine
                     : ApplyResult.Fail(failure.Code, stage,
                         Sanitize(failure.Message, context.Route.StaticExit));
             return await RecoverFailureAsync(
-                failure.Code, stage, Sanitize(failure.Message, context.Route.StaticExit), marker);
+                failure.Code, stage, Sanitize(failure.Message, context.Route.StaticExit), marker,
+                persistentWriteTargets);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             const string detail = "操作已取消。";
             if (persistentWriteCount == 0 || marker is null)
                 return ApplyResult.Fail(FailureCode.OperationCancelled, stage, detail);
-            return await RecoverFailureAsync(FailureCode.OperationCancelled, stage, detail, marker);
+            return await RecoverFailureAsync(
+                FailureCode.OperationCancelled, stage, detail, marker, persistentWriteTargets);
         }
         catch (OperationCanceledException)
         {
@@ -327,7 +376,7 @@ public sealed class ApplyEngine
                 : "静态代理或网络操作超时。";
             if (persistentWriteCount == 0 || marker is null)
                 return ApplyResult.Fail(code, stage, detail);
-            return await RecoverFailureAsync(code, stage, detail, marker);
+            return await RecoverFailureAsync(code, stage, detail, marker, persistentWriteTargets);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or
                                     InvalidOperationException or ArgumentException or JsonException or
@@ -346,7 +395,7 @@ public sealed class ApplyEngine
             var detail = Sanitize(ex.Message, context.Route.StaticExit);
             if (persistentWriteCount == 0 || marker is null)
                 return ApplyResult.Fail(code, stage, detail);
-            return await RecoverFailureAsync(code, stage, detail, marker);
+            return await RecoverFailureAsync(code, stage, detail, marker, persistentWriteTargets);
         }
         finally
         {
@@ -383,7 +432,6 @@ public sealed class ApplyEngine
         ClashInfo clash,
         RouteConfiguration route,
         IMihomoApplyClient pipe,
-        IReadOnlyDictionary<string, string> expectedDefinitionHashes,
         string? expectedExitIp,
         CancellationToken token)
     {
@@ -393,14 +441,13 @@ public sealed class ApplyEngine
             route,
             PublicIpDetector.DefaultProviders.Select(provider => provider.Host));
         Exception? probeFailure = null;
+        Exception? restoreFailure = null;
         StaticExitTestResult? result = null;
         try
         {
-            await pipe.PutInlineConfigAsync(probeRuntime, token);
-            await pipe.SelectProxyAsync(
-                RouteScriptBuilder.StaticGroupName,
-                RouteScriptBuilder.SelectedExitName(route),
-                token);
+            await _runtimeConvergence.ExecuteAsync(
+                retryToken => pipe.PutInlineConfigAsync(probeRuntime, retryToken), token);
+            await WaitForRouteRuntimeAsync(pipe, route, token);
             result = await _localExitTester.TestAsync(
                 clash.MixedPort, clash.HttpPort, clash.SocksPort,
                 expectedExitIp,
@@ -411,43 +458,41 @@ public sealed class ApplyEngine
         {
             probeFailure = ex;
         }
-
-        try
+        finally
         {
-            await pipe.PutInlineConfigAsync(formalRuntime, CancellationToken.None);
-            await pipe.SelectProxyAsync(
-                RouteScriptBuilder.StaticGroupName,
-                RouteScriptBuilder.SelectedExitName(route),
-                CancellationToken.None);
-            var restored = await RecoveryService.CaptureRuntimeSemanticBaselineAsync(
-                pipe, CancellationToken.None);
-            restored = restored with
+            try
             {
-                ManagedProxyDefinitionHashes = RecoveryService.CaptureManagedProxyDefinitionHashes(
-                    clash.RuntimeConfigPath)
-            };
-            if (!RuntimeMatchesRoute(restored, route, expectedDefinitionHashes))
-                throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
-                    "写入后出口探测结束，但无法确认正式 Runtime 已等价恢复。");
-        }
-        catch (ApplyFailure)
-        {
-            throw;
-        }
-        catch (Exception ex) when (ex is IOException or TimeoutException or JsonException or
-                                   InvalidDataException or InvalidOperationException)
-        {
-            throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
-                Sanitize(ex.Message, route.StaticExit));
+                await _runtimeConvergence.ExecuteAsync(
+                    retryToken => pipe.PutInlineConfigAsync(formalRuntime, retryToken),
+                    CancellationToken.None);
+                await WaitForRouteRuntimeAsync(pipe, route, CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is IOException or TimeoutException or OperationCanceledException or
+                                       JsonException or InvalidDataException or InvalidOperationException)
+            {
+                restoreFailure = ex;
+            }
         }
 
+        if (restoreFailure is not null)
+            throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
+                "写入后出口探测结束，但正式 Runtime 未能收敛恢复：" +
+                Sanitize(restoreFailure.Message, route.StaticExit));
         if (probeFailure is OperationCanceledException cancellation) throw cancellation;
         if (probeFailure is not null)
             throw new ApplyFailure(FailureCode.PostWriteVerificationFailed,
                 Sanitize(probeFailure.Message, route.StaticExit));
-        return result ?? new StaticExitTestResult(
+        var verified = result ?? new StaticExitTestResult(
             false, null, FailureCode.PostWriteVerificationFailed,
             "写入后无法确认 AI静态链的实际公网出口。");
+        if (!verified.Success && verified.FailureCode == FailureCode.ExitIpLookupFailed &&
+            !string.IsNullOrWhiteSpace(expectedExitIp))
+            return new StaticExitTestResult(
+                true,
+                expectedExitIp,
+                FailureCode.None,
+                "配置已生效；公网出口查询服务暂时不可用，沿用本次应用前已确认的静态出口。");
+        return verified;
     }
 
     private async Task<string?> ValidateTemporaryRuntimeAsync(
@@ -456,6 +501,7 @@ public sealed class ApplyEngine
         RouteConfiguration route,
         string originalRuntimeSha256,
         string runtimeCandidate,
+        string? knownExitIp,
         IProgress<string>? progress,
         CancellationToken token)
     {
@@ -465,7 +511,9 @@ public sealed class ApplyEngine
             throw new ApplyFailure(FailureCode.TemporaryRuntimeLoadFailed,
                 "临时验证前 Runtime YAML 已变化，请重新检查环境。");
         var pipe = _pipeFactory(clash.ControllerPipe);
-        var baseline = await CaptureTemporaryBaselineAsync(clash, subscription, pipe, token);
+        var baseline = await _runtimeConvergence.ExecuteAsync(
+            retryToken => CaptureTemporaryBaselineAsync(clash, subscription, pipe, retryToken),
+            token);
         if (!string.Equals(FileHash.Sha256(clash.RuntimeConfigPath), originalRuntimeSha256, StringComparison.Ordinal))
             throw new ApplyFailure(FailureCode.TemporaryRuntimeLoadFailed,
                 "记录 Runtime 基线期间 YAML 已变化，请重新检查环境。");
@@ -473,20 +521,25 @@ public sealed class ApplyEngine
         string? actualExitIp = null;
         try
         {
-            await pipe.PutInlineConfigAsync(runtimeCandidate, token);
-            var selectedExit = RouteScriptBuilder.SelectedExitName(route);
-            await pipe.SelectProxyAsync(RouteScriptBuilder.StaticGroupName, selectedExit, token);
-            await pipe.GetProxyDelayAsync(selectedExit, token);
+            await _runtimeConvergence.ExecuteAsync(
+                retryToken => pipe.PutInlineConfigAsync(runtimeCandidate, retryToken), token);
+            await WaitForRouteRuntimeAsync(pipe, route, token);
             if (route.TransportMode == StaticTransportMode.DialerProxy)
             {
                 var actual = await _localExitTester.TestAsync(
                     clash.MixedPort, clash.HttpPort, clash.SocksPort,
-                    string.IsNullOrWhiteSpace(route.ActualExitIp) ? null : route.ActualExitIp,
+                    string.IsNullOrWhiteSpace(knownExitIp) ? null : knownExitIp,
                     token);
-                if (!actual.Success)
+                if (!actual.Success && actual.FailureCode == FailureCode.ExitIpLookupFailed &&
+                    !string.IsNullOrWhiteSpace(knownExitIp))
+                {
+                    actualExitIp = knownExitIp;
+                    progress?.Report("候选 Runtime 已加载；公网出口查询服务暂时不可用，沿用先前已确认的出口。");
+                }
+                else if (!actual.Success)
                     throw new ApplyFailure(actual.FailureCode,
                         actual.SanitizedDetail ?? "链式连接可达，但无法确认实际公网出口。");
-                actualExitIp = actual.ActualExitIp;
+                else actualExitIp = actual.ActualExitIp;
             }
         }
         catch (Exception ex) when (ex is ApplyFailure or IOException or TimeoutException or
@@ -526,7 +579,7 @@ public sealed class ApplyEngine
             runtime);
     }
 
-    private static async Task<bool> RestoreTemporaryRuntimeAsync(
+    private async Task<bool> RestoreTemporaryRuntimeAsync(
         ClashInfo clash,
         SubscriptionInfo subscription,
         IMihomoApplyClient pipe,
@@ -535,19 +588,35 @@ public sealed class ApplyEngine
     {
         try
         {
-            await pipe.PutInlineConfigAsync(originalRuntime, CancellationToken.None);
-            if (baseline.Runtime.ManagedGroupExists &&
-                !string.IsNullOrWhiteSpace(baseline.Runtime.ManagedGroupSelection))
-            {
-                await pipe.SelectProxyAsync(
-                    RouteScriptBuilder.StaticGroupName,
-                    baseline.Runtime.ManagedGroupSelection,
-                    CancellationToken.None);
-            }
-
-            var restoredRuntime = await RecoveryService.CaptureRuntimeSemanticBaselineAsync(
-                pipe, CancellationToken.None);
-            if (!baseline.Runtime.SemanticallyEquals(restoredRuntime)) return false;
+            await _runtimeConvergence.ExecuteAsync(
+                retryToken => pipe.PutInlineConfigAsync(originalRuntime, retryToken),
+                CancellationToken.None);
+            await _runtimeConvergence.WaitAsync(
+                pipe,
+                runtime =>
+                {
+                    var mismatch = GetRuntimeSemanticMismatch(baseline.Runtime, runtime);
+                    return (mismatch is null, mismatch);
+                },
+                async (runtime, retryToken) =>
+                {
+                    if (!baseline.Runtime.ManagedGroupExists || !runtime.ManagedGroupExists ||
+                        string.IsNullOrWhiteSpace(baseline.Runtime.ManagedGroupSelection) ||
+                        string.Equals(runtime.ManagedGroupSelection, baseline.Runtime.ManagedGroupSelection,
+                            StringComparison.Ordinal)) return;
+                    try
+                    {
+                        await pipe.SelectProxyAsync(
+                            RouteScriptBuilder.StaticGroupName,
+                            baseline.Runtime.ManagedGroupSelection,
+                            retryToken);
+                    }
+                    catch (MihomoControllerException ex) when (ex.StatusCode == 404)
+                    {
+                        // 采样后 Runtime 又切换了一代；下一次采样继续判断。
+                    }
+                },
+                CancellationToken.None);
             if (!string.Equals(ReadCurrentProfileUid(clash.ProfilesPath), baseline.CurrentProfileUid,
                     StringComparison.Ordinal)) return false;
             if (!string.Equals(subscription.Uid, baseline.CurrentProfileUid, StringComparison.Ordinal)) return false;
@@ -599,35 +668,50 @@ public sealed class ApplyEngine
             throw new ApplyFailure(FailureCode.TargetChanged, "新 Script 目标被外部创建。");
     }
 
-    private static bool VerifyPersisted(
+    private static string? GetPersistedMismatch(
         ClashInfo clash,
         string currentUid,
         ProfileBindingPlan binding,
-        RouteConfiguration route)
+        ReadOnlySpan<byte> expectedScriptBytes)
     {
-        if (!File.Exists(binding.ScriptPath) ||
-            !RouteScriptBuilder.IsStrictlyOwnedScript(File.ReadAllText(binding.ScriptPath))) return false;
-        var yaml = new DeserializerBuilder().IgnoreUnmatchedProperties().Build();
-        var profiles = yaml.Deserialize<ProfilesDocument>(File.ReadAllText(clash.ProfilesPath));
-        if (profiles?.Current != currentUid) return false;
-        var current = profiles.Items.SingleOrDefault(item => item.Uid == currentUid);
-        if (current?.Option?.Script != binding.ScriptUid) return false;
+        if (!File.Exists(binding.ScriptPath)) return "AI WorkStation Script 文件不存在。";
+        var persistedScriptBytes = File.ReadAllBytes(binding.ScriptPath);
         try
         {
-            new ScriptValidator().ValidateSemantics(
-                File.ReadAllText(clash.RuntimeConfigPath), route.Targets, route);
-            return true;
+            if (!persistedScriptBytes.AsSpan().SequenceEqual(expectedScriptBytes))
+                return "持久化 Script 内容与本次已验证候选不一致。";
         }
-        catch (InvalidDataException) { return false; }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(persistedScriptBytes);
+        }
+        var yaml = new DeserializerBuilder().IgnoreUnmatchedProperties().Build();
+        var profiles = yaml.Deserialize<ProfilesDocument>(File.ReadAllText(clash.ProfilesPath));
+        if (profiles?.Current != currentUid) return "持久化 Current Profile UID 与本次目标不一致。";
+        var current = profiles.Items.SingleOrDefault(item => item.Uid == currentUid);
+        if (current?.Option?.Script != binding.ScriptUid) return "当前 Profile 未绑定本次 AI WorkStation Script。";
+        var scriptItems = profiles.Items
+            .Where(item => string.Equals(item.Uid, binding.ScriptUid, StringComparison.Ordinal))
+            .ToArray();
+        if (scriptItems.Length != 1) return "profiles.yaml 中的 AI WorkStation Script 项缺失或重复。";
+        if (!string.Equals(scriptItems[0].Type, "script", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(scriptItems[0].File, Path.GetFileName(binding.ScriptPath), StringComparison.OrdinalIgnoreCase))
+            return "profiles.yaml 中的 AI WorkStation Script 项类型或文件名不一致。";
+        return null;
     }
 
     private async Task<ApplyResult> RecoverFailureAsync(
         FailureCode originalCode,
         string stage,
         string detail,
-        TransactionMarker marker)
+        TransactionMarker marker,
+        IReadOnlyCollection<string> persistentWriteTargets)
     {
-        var recovered = await _recovery.RecoverAsync(marker, CancellationToken.None);
+        var recovered = await _recovery.RecoverAsync(
+            marker,
+            persistentWriteTargets,
+            verifyOriginalBaseline: originalCode != FailureCode.TargetChanged,
+            CancellationToken.None);
         return recovered
             ? ApplyResult.Fail(originalCode, "Recover", detail,
                 modified: true, recoveryAttempted: true, recoverySucceeded: true)
@@ -646,36 +730,121 @@ public sealed class ApplyEngine
     private static bool IsNetworkFailure(FailureCode code)
         => code is FailureCode.StaticProxyConnectionFailed or FailureCode.StaticProxyTimeout;
 
-    private static bool RuntimeMatchesRoute(
-        RuntimeSemanticBaseline runtime,
+    private async Task WaitForPersistedRuntimeDefinitionsAsync(
+        string runtimeConfigPath,
+        IReadOnlyDictionary<string, string> expectedDefinitionHashes,
+        CancellationToken token)
+    {
+        await _runtimeConvergence.ExecuteAsync(
+            retryToken =>
+            {
+                retryToken.ThrowIfCancellationRequested();
+                try
+                {
+                    var actual = RecoveryService.CaptureManagedProxyDefinitionHashes(runtimeConfigPath);
+                    if (expectedDefinitionHashes.Count == actual.Count &&
+                        expectedDefinitionHashes.All(item => actual.TryGetValue(item.Key, out var hash) &&
+                                                             string.Equals(item.Value, hash, StringComparison.Ordinal)))
+                        return Task.CompletedTask;
+                    throw new IOException(
+                        $"持久化 Runtime 受管代理定义尚未收敛；期望 {expectedDefinitionHashes.Count} 项，实际 {actual.Count} 项。");
+                }
+                catch (Exception ex) when (ex is InvalidDataException or YamlDotNet.Core.YamlException)
+                {
+                    throw new IOException("持久化 Runtime YAML 尚未完整生成。", ex);
+                }
+            },
+            token);
+    }
+
+    private async Task<RuntimeSemanticBaseline> WaitForRouteRuntimeAsync(
+        IMihomoApplyClient pipe,
         RouteConfiguration route,
-        IReadOnlyDictionary<string, string>? expectedDefinitionHashes = null)
+        CancellationToken token,
+        bool reconcileSelection = true)
+    {
+        var selectedExit = RouteScriptBuilder.SelectedExitName(route);
+        return await _runtimeConvergence.WaitAsync(
+            pipe,
+            runtime =>
+            {
+                var mismatch = GetRuntimeRouteMismatch(runtime, route);
+                return (mismatch is null, mismatch);
+            },
+            async (runtime, retryToken) =>
+            {
+                if (!reconcileSelection || !runtime.ManagedGroupExists ||
+                    string.Equals(runtime.ManagedGroupSelection, selectedExit, StringComparison.Ordinal)) return;
+                try
+                {
+                    await pipe.SelectProxyAsync(RouteScriptBuilder.StaticGroupName, selectedExit, retryToken);
+                }
+                catch (MihomoControllerException ex) when (ex.StatusCode == 404)
+                {
+                    // Runtime 正在换代时 Selector 可能在相邻采样间短暂消失；继续读取 live runtime。
+                }
+            },
+            token);
+    }
+
+    private static string? GetRuntimeRouteMismatch(
+        RuntimeSemanticBaseline runtime,
+        RouteConfiguration route)
     {
         var expectedProxyNames = string.IsNullOrWhiteSpace(route.DialerProxyGroup)
             ? new[] { RouteScriptBuilder.DirectStaticExitName }
             : new[] { RouteScriptBuilder.DirectStaticExitName, RouteScriptBuilder.DialerStaticExitName };
-        if (!runtime.ManagedProxyNames.SequenceEqual(expectedProxyNames, StringComparer.Ordinal) ||
-            !runtime.ManagedGroupExists ||
-            !string.Equals(runtime.ManagedGroupSelection, RouteScriptBuilder.SelectedExitName(route), StringComparison.Ordinal))
-            return false;
+        if (!runtime.ManagedProxyNames.SequenceEqual(expectedProxyNames, StringComparer.Ordinal))
+            return $"受管代理尚未收敛；期望 [{string.Join(", ", expectedProxyNames)}]，实际 [{string.Join(", ", runtime.ManagedProxyNames)}]。";
+        if (!runtime.ManagedGroupExists) return $"受管策略组 {RouteScriptBuilder.StaticGroupName} 尚未出现。";
 
         var expectedMembers = string.IsNullOrWhiteSpace(route.DialerProxyGroup)
             ? new[] { RouteScriptBuilder.DirectStaticExitName }
             : route.TransportMode == StaticTransportMode.DialerProxy
                 ? new[] { RouteScriptBuilder.DialerStaticExitName, RouteScriptBuilder.DirectStaticExitName }
                 : new[] { RouteScriptBuilder.DirectStaticExitName, RouteScriptBuilder.DialerStaticExitName };
-        if (!runtime.ManagedGroupMembers.SequenceEqual(expectedMembers, StringComparer.Ordinal)) return false;
+        if (!runtime.ManagedGroupMembers.SequenceEqual(expectedMembers, StringComparer.Ordinal))
+            return $"受管策略组成员尚未收敛；期望 [{string.Join(", ", expectedMembers)}]，实际 [{string.Join(", ", runtime.ManagedGroupMembers)}]。";
+        var selectedExit = RouteScriptBuilder.SelectedExitName(route);
+        if (!string.Equals(runtime.ManagedGroupSelection, selectedExit, StringComparison.Ordinal))
+            return $"受管策略组选择尚未收敛；期望 {selectedExit}，实际 {runtime.ManagedGroupSelection ?? "None"}。";
 
         var expectedExecutables = route.Targets.Select(target => target.ExecutableName)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         if (runtime.ManagedRules.Count != expectedExecutables.Length ||
             !expectedExecutables.All(executable => runtime.ManagedRules.Any(rule => IsManagedProcessRule(rule, executable))))
-            return false;
-        return expectedDefinitionHashes is null ||
-               expectedDefinitionHashes.Count == runtime.ManagedProxyDefinitionHashes.Count &&
-               expectedDefinitionHashes.All(item => runtime.ManagedProxyDefinitionHashes.TryGetValue(item.Key, out var hash) &&
-                                                    string.Equals(item.Value, hash, StringComparison.Ordinal));
+        {
+            var missing = expectedExecutables
+                .Where(executable => !runtime.ManagedRules.Any(rule => IsManagedProcessRule(rule, executable)))
+                .ToArray();
+            return missing.Length > 0
+                ? "目标程序规则尚未收敛；缺少 " + string.Join(", ", missing) + "。"
+                : $"目标程序规则数量尚未收敛；期望 {expectedExecutables.Length}，实际 {runtime.ManagedRules.Count}。";
+        }
+        return null;
+    }
+
+    internal static string? GetRuntimeSemanticMismatch(
+        RuntimeSemanticBaseline expected,
+        RuntimeSemanticBaseline actual)
+    {
+        if (expected.ManagedGroupExists != actual.ManagedGroupExists)
+            return "受管策略组存在状态与基线不一致。";
+        if (!string.Equals(expected.ManagedGroupSelection, actual.ManagedGroupSelection, StringComparison.Ordinal))
+            return $"受管策略组选择与基线不一致；期望 {expected.ManagedGroupSelection ?? "None"}，实际 {actual.ManagedGroupSelection ?? "None"}。";
+        if (!expected.ManagedProxyNames.SequenceEqual(actual.ManagedProxyNames, StringComparer.Ordinal))
+            return "受管代理名称与基线不一致。";
+        if (!expected.ManagedGroupMembers.SequenceEqual(actual.ManagedGroupMembers, StringComparer.Ordinal))
+            return "受管策略组成员与基线不一致。";
+        if (!expected.ManagedRules.SequenceEqual(actual.ManagedRules, StringComparer.Ordinal))
+            return "受管程序规则与基线不一致。";
+        if (expected.ManagedProxyDefinitionHashes.Count != actual.ManagedProxyDefinitionHashes.Count ||
+            expected.ManagedProxyDefinitionHashes.Any(item =>
+                !actual.ManagedProxyDefinitionHashes.TryGetValue(item.Key, out var hash) ||
+                !string.Equals(item.Value, hash, StringComparison.Ordinal)))
+            return "受管代理定义与持久化基线不一致。";
+        return null;
     }
 
     private static bool IsManagedProcessRule(string semantic, string executable)
@@ -708,6 +877,11 @@ public sealed class ApplyEngine
             value = value.Replace(config.Server, "***", StringComparison.OrdinalIgnoreCase);
         return value.Length <= 2000 ? value : value[..2000];
     }
+
+    private static string CombineDetails(params string?[] details)
+        => string.Join(Environment.NewLine, details
+            .Where(detail => !string.IsNullOrWhiteSpace(detail))
+            .Distinct(StringComparer.Ordinal));
 
     private static void TryDeleteDirectory(string? path)
     {
